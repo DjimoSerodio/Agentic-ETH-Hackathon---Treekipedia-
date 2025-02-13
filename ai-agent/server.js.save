@@ -12,18 +12,14 @@ process.on('unhandledRejection', err => {
 require('dotenv').config({ path: '../.env' });
 console.log("DB_HOST is:", process.env.DB_HOST);
 console.log("LIGHTHOUSE_API_KEY is:", process.env.LIGHTHOUSE_API_KEY);
-console.log("BASE_L2_RPC_URL is:", process.env.BASE_L2_RPC_URL);
 
 // Import required modules
 const express = require('express');
+const agentkit = require('@coinbase/agentkit');
 const cors = require('cors');
 const axios = require('axios');
 const FormData = require('form-data');
 const { Pool } = require('pg');
-const { createAttestation } = require('../smart-contracts/createAttestation');
-const { uploadResearchToIPFS } = require('../smart-contracts/uploadToIPFS');
-const { mintNFTree } = require('../smart-contracts/mintNFTree');
-const path = require('path');
 
 // Import the AI research service (Perplexity + ChatGPT 4o flow)
 const { performAIResearch } = require('./aiResearchService');
@@ -41,6 +37,34 @@ const pool = new Pool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD
 });
+
+// --- Function: uploadToIPFS ---
+// Uploads JSON data to IPFS via Lighthouse and returns the CID.
+async function uploadToIPFS(jsonData) {
+  const url = 'https://node.lighthouse.storage/api/v0/add?pin=true';
+  
+  // Create a FormData instance and append the JSON data as a file.
+  const formData = new FormData();
+  const buffer = Buffer.from(JSON.stringify(jsonData));
+  formData.append('file', buffer, { filename: 'research.json', contentType: 'application/json' });
+  
+  // Set up headers including the Lighthouse API key with "Bearer" prefix.
+  const headers = {
+    ...formData.getHeaders(),
+    'Authorization': `Bearer ${process.env.LIGHTHOUSE_API_KEY}`
+  };
+
+  try {
+    console.log('Uploading research JSON to IPFS via Lighthouse...');
+    const response = await axios.post(url, formData, { headers });
+    const ipfsCid = response.data.Hash;
+    console.log('Received IPFS CID from Lighthouse:', ipfsCid);
+    return ipfsCid;
+  } catch (error) {
+    console.error('Error uploading to Lighthouse:', error.response ? error.response.data : error.message);
+    throw error;
+  }
+}
 
 // --- Function: storeResearchInDB ---
 // Inserts the research data into the ai_research table.
@@ -101,7 +125,7 @@ async function storeResearchInDB(researchData, ipfsCid, researcherWallet) {
     await pool.query(query, values);
     console.log('Research data stored successfully.');
   } catch (error) {
-    console.error('Error storing research data in PostgreSQL:', error.stack);
+    console.error('Error storing research data in PostgreSQL:', error);
     throw error;
   }
 }
@@ -122,16 +146,23 @@ app.post('/ai/research', async (req, res) => {
     // Trigger the AI research workflow (Perplexity + ChatGPT 4o)
     const researchData = await performAIResearch(taxonID, scientificName, commonNames, researcherWallet);
 
-    // Upload the structured research JSON to IPFS via Lighthouse using Athus's module
-    const ipfsCid = await uploadResearchToIPFS(researchData);
+    // Upload the structured research JSON to IPFS via Lighthouse
+    const ipfsCid = await uploadToIPFS(researchData);
 
     // Store the research data in PostgreSQL (including ipfs_cid and researcher_wallet)
     await storeResearchInDB(researchData, ipfsCid, researcherWallet);
 
-    // Trigger attestation and NFT minting via Athus's modules
-    const attestationDetails = await triggerAttestationAndMint(researchData, ipfsCid, researcherWallet);
+    // Trigger the AgentKit attestation transaction using the stored IPFS CID
+    const attestationDetails = await triggerAgentKitAttestation(researchData, ipfsCid, researcherWallet);
 
-    // Combine research data with the attestation details returned by AgentKit and the IPFS CID
+    // Dummy on-chain details (to be replaced with actual on-chain actions later)
+    const onChainDetails = {
+      attestation_id: "dummy_attestation_id",
+      nftree_token_id: "dummy_nftree_token_id",
+      contreebution_token_id: "dummy_contreebution_token_id"
+    };
+
+    // Combine research data with on-chain details and IPFS CID, then return final JSON.
     const finalResponse = {
       ...researchData,
       ipfs_cid: ipfsCid,
@@ -140,8 +171,8 @@ app.post('/ai/research', async (req, res) => {
 
     res.json({ status: "success", data: finalResponse });
   } catch (error) {
-    console.error("Error in POST /ai/research endpoint:", error.stack);
-    res.status(500).json({ error: "Internal server error", details: error.message });
+    console.error("Error in POST /ai/research endpoint:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -157,41 +188,13 @@ app.get('/ai/research/:scientificName', async (req, res) => {
     }
     res.json(result.rows[0]);
   } catch (error) {
-    console.error('Error retrieving research data:', error.stack);
+    console.error('Error retrieving research data:', error);
     res.status(500).json({ error: 'Internal server error.' });
   }
 });
 
-// --- Function: triggerAttestationAndMint ---
-// Triggers attestation and NFT minting using Athus's modules.
-async function triggerAttestationAndMint(researchData, ipfsCid, researcherWallet) {
-  try {
-    console.log("Creating attestation using Athus's module...");
-    const attestationUID = await createAttestation();
-    console.log("Attestation UID:", attestationUID);
-
-    // Reuse the IPFS CID as the token URI.
-    const tokenURI = ipfsCid;
-
-    console.log("Minting NFT using Athus's mintNFTree module...");
-    // Using the researcherWallet as recipient; tokenId 2 and amount 1 are examples.
-    const mintReceipt = await mintNFTree(researcherWallet, 2, 1, tokenURI);
-    console.log("Mint Receipt:", mintReceipt);
-
-    return {
-      attestation_id: attestationUID,
-      attestation_metadata_ipfs: tokenURI,
-      nft_mint_receipt: mintReceipt
-    };
-  } catch (error) {
-    console.error("Error in triggerAttestationAndMint:", error.stack);
-    throw error;
-  }
-}
-
 // Start the Express server on port 3000 (or the port specified in .env)
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, () => {
   console.log(`AI Research API listening on port ${PORT}`);
 });
-
